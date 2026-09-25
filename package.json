@@ -1,0 +1,13 @@
+{
+  "name": "pulsegrid",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-tenant incident-response platform",
+  "scripts": {
+    "test": "echo \"Tests not implemented yet\"",
+    "lint": "echo \"Linting not configured yet\""
+  },
+  "engines": {
+    "node": "20.x"
+  }
+}
