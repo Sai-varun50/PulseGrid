@@ -4,10 +4,16 @@
   "private": true,
   "description": "Multi-tenant incident-response platform",
   "scripts": {
-  "test": "echo \"Tests are organized per service\"",
-  "lint": "echo \"Linting not configured yet\""
-},
+    "test": "echo \"Tests are organized per service\"",
+    "lint": "echo \"Linting not configured yet\""
+  },
   "engines": {
     "node": "24.x"
+  },
+  "dependencies": {
+    "argon2": "^0.45.1",
+    "cookie-parser": "^1.4.7",
+    "jsonwebtoken": "^9.0.3",
+    "zod": "^4.6.5"
   }
 }
