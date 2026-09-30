@@ -1,12 +1,16 @@
 const express = require("express");
 const cookieParser = require("cookie-parser");
+
 const authRouter = require("./routes/auth");
+const apiKeysRouter = require("./routes/apiKeys");
+
 const app = express();
 
 app.use(express.json());
 app.use(cookieParser());
 
 app.use("/auth", authRouter);
+app.use("/api-keys", apiKeysRouter);
 
 app.get("/health", (_req, res) => {
   res.status(200).json({
@@ -22,6 +26,5 @@ if (require.main === module) {
     console.log(`PulseGrid API listening on port ${port}`);
   });
 }
-
 
 module.exports = { app };
