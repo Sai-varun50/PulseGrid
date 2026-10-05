@@ -40,14 +40,50 @@ async function ingestIncident({ orgId, payload }) {
       };
     }
 
-    const [incidentId] = await trx("incidents").insert({
+    let incidentId;
+
+try {
+  [incidentId] = await trx("incidents").insert({
+    service_id: payload.service_id,
+    title: payload.title,
+    description: payload.description ?? null,
+    status: "triggered",
+    severity: payload.severity,
+    dedup_key: payload.fingerprint,
+  });
+} catch (error) {
+  if (error.code !== "ER_DUP_ENTRY") {
+    throw error;
+  }
+
+  const duplicateIncident = await trx("incidents")
+    .select("id")
+    .where({
       service_id: payload.service_id,
-      title: payload.title,
-      description: payload.description ?? null,
-      status: "triggered",
-      severity: payload.severity,
       dedup_key: payload.fingerprint,
-    });
+    })
+    .whereIn("status", ["triggered", "acknowledged"])
+    .forUpdate()
+    .first();
+
+  if (!duplicateIncident) {
+    throw error;
+  }
+
+  await trx("incident_events").insert({
+    incident_id: duplicateIncident.id,
+    type: "dedup_merged",
+    actor_id: null,
+    note: payload.event_id
+      ? `Webhook event ${payload.event_id} merged into existing incident.`
+      : "Webhook event merged into existing incident.",
+  });
+
+  return {
+    incident_id: duplicateIncident.id,
+    status: "merged",
+  };
+}
 
     await trx("incident_events").insert({
       incident_id: incidentId,

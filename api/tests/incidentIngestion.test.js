@@ -350,3 +350,131 @@ test.after(async () => {
     await redis.quit();
   }
 });
+test("same fingerprint after resolution creates a new incident", async () => {
+  const fixture = await createFixture();
+
+  try {
+    const first = await ingestIncident({
+      orgId: fixture.orgId,
+      payload: {
+        service_id: fixture.serviceId,
+        title: "Checkout API failure",
+        severity: "high",
+        fingerprint: "checkout-api-5xx",
+        event_id: "event-001",
+      },
+    });
+
+    assert.equal(first.status, "created");
+
+    await db("incidents")
+      .where("id", first.incident_id)
+      .update({
+        status: "resolved",
+      });
+
+    const second = await ingestIncident({
+      orgId: fixture.orgId,
+      payload: {
+        service_id: fixture.serviceId,
+        title: "Checkout API failure again",
+        severity: "high",
+        fingerprint: "checkout-api-5xx",
+        event_id: "event-002",
+      },
+    });
+
+    assert.equal(second.status, "created");
+    assert.notEqual(second.incident_id, first.incident_id);
+
+    const incidents = await db("incidents")
+      .where("service_id", fixture.serviceId)
+      .orderBy("id");
+
+    assert.equal(incidents.length, 2);
+    assert.equal(incidents[0].status, "resolved");
+    assert.equal(incidents[1].status, "triggered");
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+test("concurrent identical alerts create only one incident", async () => {
+  const fixture = await createFixture();
+
+  try {
+    const payload = {
+      service_id: fixture.serviceId,
+      title: "Checkout API returning 5xx",
+      severity: "high",
+      fingerprint: "concurrent-checkout-5xx",
+    };
+
+    const [first, second] = await Promise.all([
+      ingestIncident({
+        orgId: fixture.orgId,
+        payload: {
+          ...payload,
+          event_id: "concurrent-event-001",
+        },
+      }),
+      ingestIncident({
+        orgId: fixture.orgId,
+        payload: {
+          ...payload,
+          event_id: "concurrent-event-002",
+        },
+      }),
+    ]);
+
+    const incidents = await db("incidents")
+      .where("service_id", fixture.serviceId)
+      .where("dedup_key", payload.fingerprint);
+
+    assert.equal(incidents.length, 1);
+
+    const statuses = [first.status, second.status].sort();
+
+    assert.deepEqual(statuses, ["created", "merged"]);
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+test("merged webhook records the incoming event_id", async () => {
+  const fixture = await createFixture();
+
+  try {
+    const first = await ingestIncident({
+      orgId: fixture.orgId,
+      payload: {
+        service_id: fixture.serviceId,
+        title: "Checkout API failure",
+        severity: "high",
+        fingerprint: "event-id-dedup-test",
+        event_id: "event-original",
+      },
+    });
+
+    const second = await ingestIncident({
+      orgId: fixture.orgId,
+      payload: {
+        service_id: fixture.serviceId,
+        title: "Checkout API failure again",
+        severity: "critical",
+        fingerprint: "event-id-dedup-test",
+        event_id: "event-duplicate",
+      },
+    });
+
+    assert.equal(second.status, "merged");
+
+    const dedupEvent = await db("incident_events")
+      .where("incident_id", first.incident_id)
+      .where("type", "dedup_merged")
+      .first();
+
+    assert.ok(dedupEvent);
+    assert.match(dedupEvent.note, /event-duplicate/);
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
