@@ -1,4 +1,5 @@
 const db = require("../lib/db");
+const { correlateIncident } = require("./correlationService");
 
 async function ingestIncident({ orgId, payload }) {
   return db.transaction(async (trx) => {
@@ -42,48 +43,52 @@ async function ingestIncident({ orgId, payload }) {
 
     let incidentId;
 
-try {
-  [incidentId] = await trx("incidents").insert({
-    service_id: payload.service_id,
-    title: payload.title,
-    description: payload.description ?? null,
-    status: "triggered",
-    severity: payload.severity,
-    dedup_key: payload.fingerprint,
-  });
-} catch (error) {
-  if (error.code !== "ER_DUP_ENTRY") {
-    throw error;
-  }
+    try {
+      [incidentId] = await trx("incidents").insert({
+        service_id: payload.service_id,
+        title: payload.title,
+        description: payload.description ?? null,
+        status: "triggered",
+        severity: payload.severity,
+        dedup_key: payload.fingerprint,
+      });
+    } catch (error) {
+      if (error.code !== "ER_DUP_ENTRY") {
+        throw error;
+      }
 
-  const duplicateIncident = await trx("incidents")
-    .select("id")
-    .where({
-      service_id: payload.service_id,
-      dedup_key: payload.fingerprint,
-    })
-    .whereIn("status", ["triggered", "acknowledged"])
-    .forUpdate()
-    .first();
+      const duplicateIncident = await trx("incidents")
+        .select("id")
+        .where({
+          service_id: payload.service_id,
+          dedup_key: payload.fingerprint,
+        })
+        .whereIn("status", ["triggered", "acknowledged"])
+        .forUpdate()
+        .first();
 
-  if (!duplicateIncident) {
-    throw error;
-  }
+      if (!duplicateIncident) {
+        throw error;
+      }
 
-  await trx("incident_events").insert({
-    incident_id: duplicateIncident.id,
-    type: "dedup_merged",
-    actor_id: null,
-    note: payload.event_id
-      ? `Webhook event ${payload.event_id} merged into existing incident.`
-      : "Webhook event merged into existing incident.",
-  });
+      await trx("incident_events").insert({
+        incident_id: duplicateIncident.id,
+        type: "dedup_merged",
+        actor_id: null,
+        note: payload.event_id
+          ? `Webhook event ${payload.event_id} merged into existing incident.`
+          : "Webhook event merged into existing incident.",
+      });
 
-  return {
-    incident_id: duplicateIncident.id,
-    status: "merged",
-  };
-}
+      return {
+        incident_id: duplicateIncident.id,
+        status: "merged",
+      };
+    }
+
+    // T14: correlate the newly created incident with
+    // recent open incidents from the same team.
+    const correlationResult = await correlateIncident(trx, incidentId);
 
     await trx("incident_events").insert({
       incident_id: incidentId,
@@ -97,6 +102,7 @@ try {
     return {
       incident_id: incidentId,
       status: "created",
+      cluster_id: correlationResult.cluster_id,
     };
   });
 }

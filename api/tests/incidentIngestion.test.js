@@ -7,12 +7,15 @@ process.env.PULSEGRID_WEBHOOK_SECRET = "test-webhook-secret";
 
 const db = require("../src/lib/db");
 const redis = require("../src/lib/redis");
+
 const {
   ingestIncident,
 } = require("../src/services/incidentIngestionService");
+
 const {
   createApiKey,
 } = require("../src/services/apiKeyService");
+
 const { app } = require("../src/index");
 
 async function createFixture() {
@@ -54,6 +57,10 @@ async function cleanupFixture({
 
   await db("incidents")
     .where("service_id", serviceId)
+    .del();
+
+  await db("incident_clusters")
+    .where("team_id", teamId)
     .del();
 
   await db("services")
@@ -197,6 +204,7 @@ test("POST /webhook/incidents rejects invalid payload", async () => {
     });
 
     assert.equal(response.status, 400);
+
     assert.equal(
       response.body.error.code,
       "INVALID_WEBHOOK_PAYLOAD"
@@ -252,6 +260,238 @@ test("creates an incident and triggered event", async () => {
 
     assert.equal(event.type, "triggered");
     assert.equal(event.actor_id, null);
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+/*
+ * T14
+ * Rule-based alert correlation:
+ * three recent open incidents from the same team
+ * should belong to one cluster.
+ */
+test("correlates three same-team incidents into one cluster", async () => {
+  const fixture = await createFixture();
+
+  try {
+    const first = await ingestIncident({
+      orgId: fixture.orgId,
+      payload: {
+        service_id: fixture.serviceId,
+        title: "Checkout API latency",
+        description: "Latency above threshold",
+        severity: "high",
+        fingerprint: "checkout-latency",
+        event_id: "correlation-event-001",
+      },
+    });
+
+    const second = await ingestIncident({
+      orgId: fixture.orgId,
+      payload: {
+        service_id: fixture.serviceId,
+        title: "Checkout API errors",
+        description: "Error rate increased",
+        severity: "high",
+        fingerprint: "checkout-errors",
+        event_id: "correlation-event-002",
+      },
+    });
+
+    const third = await ingestIncident({
+      orgId: fixture.orgId,
+      payload: {
+        service_id: fixture.serviceId,
+        title: "Checkout API connection failures",
+        description: "Connection failures increased",
+        severity: "critical",
+        fingerprint: "checkout-connections",
+        event_id: "correlation-event-003",
+      },
+    });
+
+    assert.equal(first.status, "created");
+    assert.equal(second.status, "created");
+    assert.equal(third.status, "created");
+
+    assert.ok(first.cluster_id);
+    assert.equal(second.cluster_id, first.cluster_id);
+    assert.equal(third.cluster_id, first.cluster_id);
+
+    const incidents = await db("incidents")
+      .where("service_id", fixture.serviceId)
+      .orderBy("id");
+
+    assert.equal(incidents.length, 3);
+
+    assert.equal(incidents[0].cluster_id, first.cluster_id);
+    assert.equal(incidents[1].cluster_id, first.cluster_id);
+    assert.equal(incidents[2].cluster_id, first.cluster_id);
+
+    const clusters = await db("incident_clusters")
+      .where("team_id", fixture.teamId);
+
+    assert.equal(clusters.length, 1);
+    assert.equal(clusters[0].id, first.cluster_id);
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+/*
+ * T15 - Step 1
+ * Incidents from different teams must not share a cluster.
+ */
+test("does not correlate incidents from different teams", async () => {
+  const fixture = await createFixture();
+
+  let otherTeamId;
+  let otherServiceId;
+
+  try {
+    const [otherTeam] = await db("teams").insert({
+      org_id: fixture.orgId,
+      name: "T15 Other Team",
+    });
+
+    otherTeamId = otherTeam;
+
+    const [otherService] = await db("services").insert({
+      team_id: otherTeamId,
+      name: "T15 Other Service",
+    });
+
+    otherServiceId = otherService;
+
+    const first = await ingestIncident({
+      orgId: fixture.orgId,
+      payload: {
+        service_id: fixture.serviceId,
+        title: "Team A database alert",
+        severity: "high",
+        fingerprint: "team-a-alert",
+        event_id: "t15-event-001",
+      },
+    });
+
+    const second = await ingestIncident({
+      orgId: fixture.orgId,
+      payload: {
+        service_id: otherServiceId,
+        title: "Team B database alert",
+        severity: "high",
+        fingerprint: "team-b-alert",
+        event_id: "t15-event-002",
+      },
+    });
+
+    assert.equal(first.status, "created");
+    assert.equal(second.status, "created");
+
+    assert.ok(first.cluster_id);
+    assert.ok(second.cluster_id);
+
+    assert.notEqual(second.cluster_id, first.cluster_id);
+
+    const firstCluster = await db("incident_clusters")
+      .where("id", first.cluster_id)
+      .first();
+
+    const secondCluster = await db("incident_clusters")
+      .where("id", second.cluster_id)
+      .first();
+
+    assert.equal(firstCluster.team_id, fixture.teamId);
+    assert.equal(secondCluster.team_id, otherTeamId);
+  } finally {
+    if (otherServiceId) {
+      await db("incident_events")
+        .whereIn(
+          "incident_id",
+          db("incidents")
+            .select("id")
+            .where("service_id", otherServiceId)
+        )
+        .del();
+
+      await db("incidents")
+        .where("service_id", otherServiceId)
+        .del();
+
+      await db("incident_clusters")
+        .where("team_id", otherTeamId)
+        .del();
+
+      await db("services")
+        .where("id", otherServiceId)
+        .del();
+    }
+
+    if (otherTeamId) {
+      await db("teams")
+        .where("id", otherTeamId)
+        .del();
+    }
+
+    await cleanupFixture(fixture);
+  }
+});
+
+/*
+ * T15 - Step 2
+ * An incident outside the configured correlation window
+ * must not join the previous incident's cluster.
+ */
+test("does not correlate incidents outside the correlation window", async () => {
+  const fixture = await createFixture();
+
+  try {
+    const first = await ingestIncident({
+      orgId: fixture.orgId,
+      payload: {
+        service_id: fixture.serviceId,
+        title: "Old database alert",
+        severity: "high",
+        fingerprint: "old-database-alert",
+        event_id: "t15-window-001",
+      },
+    });
+
+    assert.equal(first.status, "created");
+    assert.ok(first.cluster_id);
+
+    // Move the first incident outside the 5-minute
+    // correlation window.
+    await db("incidents")
+      .where("id", first.incident_id)
+      .update({
+        created_at: db.raw(
+          "DATE_SUB(NOW(), INTERVAL 6 MINUTE)"
+        ),
+      });
+
+    const second = await ingestIncident({
+      orgId: fixture.orgId,
+      payload: {
+        service_id: fixture.serviceId,
+        title: "New database alert",
+        severity: "high",
+        fingerprint: "new-database-alert",
+        event_id: "t15-window-002",
+      },
+    });
+
+    assert.equal(second.status, "created");
+    assert.ok(second.cluster_id);
+
+    assert.notEqual(second.cluster_id, first.cluster_id);
+
+    const clusters = await db("incident_clusters")
+      .where("team_id", fixture.teamId)
+      .orderBy("id");
+
+    assert.equal(clusters.length, 2);
   } finally {
     await cleanupFixture(fixture);
   }
@@ -350,6 +590,7 @@ test.after(async () => {
     await redis.quit();
   }
 });
+
 test("same fingerprint after resolution creates a new incident", async () => {
   const fixture = await createFixture();
 
@@ -398,6 +639,7 @@ test("same fingerprint after resolution creates a new incident", async () => {
     await cleanupFixture(fixture);
   }
 });
+
 test("concurrent identical alerts create only one incident", async () => {
   const fixture = await createFixture();
 
@@ -417,6 +659,7 @@ test("concurrent identical alerts create only one incident", async () => {
           event_id: "concurrent-event-001",
         },
       }),
+
       ingestIncident({
         orgId: fixture.orgId,
         payload: {
@@ -439,6 +682,7 @@ test("concurrent identical alerts create only one incident", async () => {
     await cleanupFixture(fixture);
   }
 });
+
 test("merged webhook records the incoming event_id", async () => {
   const fixture = await createFixture();
 
