@@ -392,7 +392,10 @@ test("does not correlate incidents from different teams", async () => {
     assert.ok(first.cluster_id);
     assert.ok(second.cluster_id);
 
-    assert.notEqual(second.cluster_id, first.cluster_id);
+    assert.notEqual(
+      second.cluster_id,
+      first.cluster_id
+    );
 
     const firstCluster = await db("incident_clusters")
       .where("id", first.cluster_id)
@@ -485,7 +488,10 @@ test("does not correlate incidents outside the correlation window", async () => 
     assert.equal(second.status, "created");
     assert.ok(second.cluster_id);
 
-    assert.notEqual(second.cluster_id, first.cluster_id);
+    assert.notEqual(
+      second.cluster_id,
+      first.cluster_id
+    );
 
     const clusters = await db("incident_clusters")
       .where("team_id", fixture.teamId)
@@ -524,7 +530,10 @@ test("merges into an existing open incident with the same fingerprint", async ()
     });
 
     assert.equal(second.status, "merged");
-    assert.equal(second.incident_id, first.incident_id);
+    assert.equal(
+      second.incident_id,
+      first.incident_id
+    );
 
     const incidents = await db("incidents")
       .where("service_id", fixture.serviceId);
@@ -564,7 +573,10 @@ test("rejects a service belonging to another organization", async () => {
           },
         }),
         (error) => {
-          assert.equal(error.code, "INVALID_SERVICE");
+          assert.equal(
+            error.code,
+            "INVALID_SERVICE"
+          );
           return true;
         }
       );
@@ -626,7 +638,10 @@ test("same fingerprint after resolution creates a new incident", async () => {
     });
 
     assert.equal(second.status, "created");
-    assert.notEqual(second.incident_id, first.incident_id);
+    assert.notEqual(
+      second.incident_id,
+      first.incident_id
+    );
 
     const incidents = await db("incidents")
       .where("service_id", fixture.serviceId)
@@ -675,9 +690,15 @@ test("concurrent identical alerts create only one incident", async () => {
 
     assert.equal(incidents.length, 1);
 
-    const statuses = [first.status, second.status].sort();
+    const statuses = [
+      first.status,
+      second.status,
+    ].sort();
 
-    assert.deepEqual(statuses, ["created", "merged"]);
+    assert.deepEqual(
+      statuses,
+      ["created", "merged"]
+    );
   } finally {
     await cleanupFixture(fixture);
   }
@@ -717,7 +738,130 @@ test("merged webhook records the incoming event_id", async () => {
       .first();
 
     assert.ok(dedupEvent);
-    assert.match(dedupEvent.note, /event-duplicate/);
+    assert.match(
+      dedupEvent.note,
+      /event-duplicate/
+    );
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+/*
+ * T15 - Step 3
+ * The same event_id received twice must not create
+ * another incident.
+ */
+test("duplicate event_id does not create another incident", async () => {
+  const fixture = await createFixture();
+
+  try {
+    const payload = {
+      service_id: fixture.serviceId,
+      title: "Checkout API duplicate event",
+      description: "Same event delivered twice",
+      severity: "high",
+      fingerprint: "duplicate-event-fingerprint",
+      event_id: "duplicate-event-001",
+    };
+
+    const first = await ingestIncident({
+      orgId: fixture.orgId,
+      payload,
+    });
+
+    const second = await ingestIncident({
+      orgId: fixture.orgId,
+      payload,
+    });
+
+    assert.equal(first.status, "created");
+    assert.equal(second.status, "duplicate");
+    assert.equal(
+      second.incident_id,
+      first.incident_id
+    );
+
+    const incidents = await db("incidents")
+      .where("service_id", fixture.serviceId);
+
+    assert.equal(incidents.length, 1);
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+/*
+ * T15 - Step 4
+ * An incident that already belongs to another cluster must not
+ * be moved into the cluster created for a new correlation.
+ */
+test("does not over-cluster an incident already assigned to another cluster", async () => {
+  const fixture = await createFixture();
+
+  try {
+    // Create the first incident.
+    const first = await ingestIncident({
+      orgId: fixture.orgId,
+      payload: {
+        service_id: fixture.serviceId,
+        title: "Checkout API first incident",
+        description: "First incident",
+        severity: "high",
+        fingerprint: "overcluster-first",
+        event_id: "overcluster-event-001",
+      },
+    });
+
+    assert.equal(first.status, "created");
+    assert.ok(first.cluster_id);
+
+    // Create a separate cluster.
+    const [separateClusterId] = await db("incident_clusters").insert({
+      team_id: fixture.teamId,
+    });
+
+    // Create an incident that is already assigned to that cluster.
+    const [separateIncidentId] = await db("incidents").insert({
+      service_id: fixture.serviceId,
+      title: "Checkout API separate incident",
+      description: "Already assigned to another cluster",
+      status: "triggered",
+      severity: "high",
+      dedup_key: "overcluster-separate",
+      cluster_id: separateClusterId,
+    });
+
+    // Create another incident within the correlation window.
+    await ingestIncident({
+      orgId: fixture.orgId,
+      payload: {
+        service_id: fixture.serviceId,
+        title: "Checkout API third incident",
+        description: "Third incident",
+        severity: "high",
+        fingerprint: "overcluster-third",
+        event_id: "overcluster-event-003",
+      },
+    });
+
+    // The already-clustered incident must remain in its
+    // original cluster.
+    const separateIncident = await db("incidents")
+      .select("cluster_id")
+      .where("id", separateIncidentId)
+      .first();
+
+    assert.equal(
+      separateIncident.cluster_id,
+      separateClusterId
+    );
+
+    // It must not have been moved into the first cluster.
+    assert.notEqual(
+      separateIncident.cluster_id,
+      first.cluster_id
+    );
   } finally {
     await cleanupFixture(fixture);
   }

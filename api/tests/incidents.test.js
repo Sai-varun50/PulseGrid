@@ -50,7 +50,6 @@ async function createFixture() {
     accessToken: createAccessToken(user),
   };
 }
-
 async function cleanupFixture({
   orgId,
   teamId,
@@ -68,6 +67,10 @@ async function cleanupFixture({
 
   await db("incidents")
     .where("service_id", serviceId)
+    .del();
+
+  await db("incident_clusters")
+    .where("team_id", teamId)
     .del();
 
   await db("users")

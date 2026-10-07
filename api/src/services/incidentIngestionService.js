@@ -16,6 +16,26 @@ async function ingestIncident({ orgId, payload }) {
       throw error;
     }
 
+    /*
+     * T15 - Duplicate event protection
+     *
+     * If the exact same webhook event_id has already been recorded,
+     * do not create or merge another incident.
+     */
+    if (payload.event_id) {
+      const existingEvent = await trx("incident_events")
+        .select("incident_id")
+        .where("note", "like", `%${payload.event_id}%`)
+        .first();
+
+      if (existingEvent) {
+        return {
+          incident_id: existingEvent.incident_id,
+          status: "duplicate",
+        };
+      }
+    }
+
     const existingIncident = await trx("incidents")
       .select("id")
       .where({
